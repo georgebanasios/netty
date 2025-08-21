@@ -385,9 +385,6 @@ final class AdaptivePoolingAllocator {
         private volatile AbstractMagazine[] magazines;
         private final Thread ownerThread;
         private volatile boolean freed;
-        private final Queue<Chunk> threadLocalChunkQueue;
-        private final ArrayDeque<Chunk> localChunkCache;
-        private final boolean isThreadLocal;
 
         MagazineGroup(AdaptivePoolingAllocator allocator,
                       ChunkAllocator chunkAllocator,
@@ -397,16 +394,7 @@ final class AdaptivePoolingAllocator {
             this.allocator = allocator;
             this.chunkAllocator = chunkAllocator;
             this.chunkControllerFactory = chunkControllerFactory;
-            this.isThreadLocal = isThreadLocal;
-            if (isThreadLocal) {
-                threadLocalChunkQueue = createSharedChunkQueue(false);
-                localChunkCache = null;
-                externalChunkQueue = null;
-            } else {
-                externalChunkQueue = createSharedChunkQueue(true);
-                localChunkCache = new ArrayDeque<>(LOCAL_CHUNK_REUSE_QUEUE_CAPACITY);
-                threadLocalChunkQueue = null;
-            }
+            this.externalChunkQueue = createSharedChunkQueue(!isThreadLocal);
 
             if (isThreadLocal) {
                 ownerThread = Thread.currentThread();
@@ -507,12 +495,7 @@ final class AdaptivePoolingAllocator {
                 return false;
             }
 
-            boolean offered;
-            if (isThreadLocal) {
-                offered = threadLocalChunkQueue.offer(buffer);
-            } else {
-                offered = externalChunkQueue.offer(buffer);
-            }
+            boolean offered = externalChunkQueue.offer(buffer);
 
             if (freed && offered) {
                 freeChunkReuseQueue();
@@ -520,40 +503,8 @@ final class AdaptivePoolingAllocator {
             return offered;
         }
 
-        private Chunk pollFromQueueUnshared() {
-            return threadLocalChunkQueue.poll();
-        }
-
-        private Chunk pollFromQueueShared(boolean useLocalCache) {
-            if (useLocalCache) {
-                // We are in a locked context, safe to use the local cache.
-                Chunk chunk = localChunkCache.pollFirst();
-                if (chunk != null) {
-                    return chunk;
-                }
-
-                drainToLocalCache();
-
-                return localChunkCache.pollFirst();
-            }
-
-            // We are not in a locked context, so poll directly from the shared MPMC queue.
+        private Chunk pollFromExternalQueue() {
             return externalChunkQueue.poll();
-        }
-
-        /**
-         * Drains chunks from the shared external queue into the thread-local cache
-         * until the local cache is full or the external queue is empty.
-         * This method is only safe to call for shared magazines when holding the magazine lock.
-         */
-        private void drainToLocalCache() {
-            while (localChunkCache.size() < LOCAL_CHUNK_REUSE_QUEUE_CAPACITY) {
-                Chunk chunk = externalChunkQueue.poll();
-                if (chunk == null) {
-                    break;
-                }
-                localChunkCache.addLast(chunk);
-            }
         }
 
         private void free() {
@@ -575,14 +526,8 @@ final class AdaptivePoolingAllocator {
         }
 
         private void freeChunkReuseQueue() {
-            Queue<Chunk> queue;
-            if (isThreadLocal) {
-                queue = threadLocalChunkQueue;
-            } else {
-                queue = externalChunkQueue;
-            }
             for (;;) {
-                Chunk chunk = queue.poll();
+                Chunk chunk = externalChunkQueue.poll();
                 if (chunk == null) {
                     break;
                 }
@@ -899,6 +844,7 @@ final class AdaptivePoolingAllocator {
         protected final ChunkController chunkController;
         protected final Queue<AdaptiveByteBuf> externalBuffers;
         protected final Thread ownerThread;
+        protected final ArrayDeque<Chunk> localChunkCache;
         private final boolean isShared;
 
         AbstractMagazine(MagazineGroup group, ChunkController chunkController, Queue<AdaptiveByteBuf> externalBuffers,
@@ -908,6 +854,7 @@ final class AdaptivePoolingAllocator {
             this.externalBuffers = externalBuffers;
             this.ownerThread = ownerThread;
             this.isShared = ownerThread == null;
+            this.localChunkCache = new ArrayDeque<>(LOCAL_CHUNK_REUSE_QUEUE_CAPACITY);
         }
 
         /**
@@ -1071,7 +1018,7 @@ final class AdaptivePoolingAllocator {
                 return false;
             }
             if (curr == null) {
-                curr = group.pollFromQueueShared(false);
+                curr = group.pollFromExternalQueue();
                 if (curr == null) {
                     return false;
                 }
@@ -1148,8 +1095,13 @@ final class AdaptivePoolingAllocator {
 
         private boolean allocateAndRefillCurrentFromGroup(int size, int maxCapacity,
                                                           AdaptiveByteBuf buf, int startingCapacity) {
-            Chunk curr;
-            curr = group.pollFromQueueShared(true);
+            // we have the magazine lock so poll from the local FIFO queue instead of the external.
+            Chunk curr = localChunkCache.pollFirst();
+            if (curr == null) {
+                // Refill local cache from the shared queue.
+                drainToLocalCache();
+                curr = localChunkCache.pollFirst();
+            }
             if (curr == null) {
                 curr = chunkController.newChunkAllocation(size, this);
             } else {
@@ -1188,6 +1140,16 @@ final class AdaptivePoolingAllocator {
                 }
             }
             return true;
+        }
+
+        private void drainToLocalCache() {
+            while (localChunkCache.size() < LOCAL_CHUNK_REUSE_QUEUE_CAPACITY) {
+                Chunk chunk = group.externalChunkQueue.poll();
+                if (chunk == null) {
+                    break;
+                }
+                localChunkCache.addLast(chunk);
+            }
         }
 
         private void restoreMagazineFreed() {
@@ -1343,7 +1305,15 @@ final class AdaptivePoolingAllocator {
 
         private boolean allocateAndRefillCurrentFromGroup(int size, int maxCapacity,
                                                           AdaptiveByteBuf buf, int startingCapacity) {
-            Chunk curr = group.pollFromQueueUnshared();
+            Chunk curr = null;
+            if (isOwnerThread()) {
+                curr = localChunkCache.pollFirst();
+            }
+
+            if (curr == null) {
+                // If not the owner or if the local cache is empty, use the group's external queue.
+                curr = group.pollFromExternalQueue();
+            }
             if (curr == null) {
                 curr = chunkController.newChunkAllocation(size, this);
             } else {
@@ -1383,13 +1353,20 @@ final class AdaptivePoolingAllocator {
                 nextInLine = chunk;
                 return;
             }
+
+            Chunk lessUsefulChunk;
             if (chunk.remainingCapacity() > nextInLine.remainingCapacity()) {
-                Chunk oldNext = nextInLine;
+                lessUsefulChunk = nextInLine;
                 nextInLine = chunk;
-                oldNext.releaseFromMagazine();
-                return;
+            } else {
+                lessUsefulChunk = chunk;
             }
-            chunk.releaseFromMagazine();
+
+            if (isOwnerThread() && localChunkCache.size() < LOCAL_CHUNK_REUSE_QUEUE_CAPACITY) {
+                localChunkCache.addLast(lessUsefulChunk);
+            } else {
+                lessUsefulChunk.releaseFromMagazine();
+            }
         }
 
         @Override
@@ -1744,11 +1721,6 @@ final class AdaptivePoolingAllocator {
         private final int[] stack;
         private int top;
 
-        IntStack(int capacity) {
-            stack = new int[capacity];
-            top = -1;
-        }
-
         IntStack(int[] initialValues) {
             stack = new int[initialValues.length];
             // copy reversed
@@ -1812,9 +1784,7 @@ final class AdaptivePoolingAllocator {
                         return segmentOffsets[counter++];
                     }
                 });
-                // since the allocation path for shared magazines is guarded by a lock, it's safe to use the
-                // local free list for the shared path as well.
-                localFreeList = new IntStack(segmentCount);
+                localFreeList = null;
             } else {
                 localFreeList = new IntStack(segmentOffsets);
             }
@@ -1827,10 +1797,18 @@ final class AdaptivePoolingAllocator {
             assert state == AVAILABLE;
             IntStack localFreeList = this.localFreeList;
             final int startIndex;
-            if (localFreeList.isEmpty() && copyIntoLocalFreeList(localFreeList) == 0) {
-                throw new IllegalStateException("Free list is empty");
+            if (localFreeList != null) {
+                assert Thread.currentThread() == ownerThread;
+                if (localFreeList.isEmpty() && copyIntoLocalFreeList(localFreeList) == 0) {
+                    throw new IllegalStateException("Free list is empty");
+                }
+                startIndex = localFreeList.pop();
+            } else {
+                startIndex = externalFreeList.poll();
+                if (startIndex == FREE_LIST_EMPTY) {
+                    throw new IllegalStateException("Free list is empty");
+                }
             }
-            startIndex = localFreeList.pop();
 
             allocatedBytes += segmentSize;
             SizeClassedChunk chunk = this;
@@ -1848,27 +1826,11 @@ final class AdaptivePoolingAllocator {
             }
         }
 
-        /**
-         * Drains segments from the thread-safe externalFreeList into the non-thread-safe localFreeList.
-         * This acts as a bulk-refill operation to restock the local cache, making later allocations
-         * faster by avoiding repeated access to the concurrent MpscIntQueue.
-         * <p>
-         * A capacity check is needed here. Because segments can be released by any thread and are
-         * always added to the externalFreeList, a situation can arise where this method is called
-         * to drain more segments than the localFreeList has available slots.
-         * Without checking `localFreeList.size() < capacity`, this would cause an
-         * ArrayIndexOutOfBoundsException by pushing onto a full stack. The loop therefore terminates
-         * when either the local list is full or the external list is empty.
-         */
         private int copyIntoLocalFreeList(IntStack localFreeList) {
             final MpscIntQueue externalFreeList = this.externalFreeList;
-            final int capacity = localFreeList.stack.length;
+            int index;
             int count = 0;
-            while (localFreeList.size() < capacity) {
-                int index = externalFreeList.poll();
-                if (index == FREE_LIST_EMPTY) {
-                    break;
-                }
+            while ((index = externalFreeList.poll()) != FREE_LIST_EMPTY) {
                 localFreeList.push(index);
                 count++;
             }
@@ -1884,7 +1846,7 @@ final class AdaptivePoolingAllocator {
             // TODO we could optimize this to save reading the externalFreeList.size() if we know that
             //      localFreeList is not null and has enough capacity
             int updatedRemainingCapacity = externalFreeList.size() * segmentSize;
-            if (ownerThread != null) {
+            if (localFreeList != null) {
                 assert Thread.currentThread() == ownerThread;
                 updatedRemainingCapacity += localFreeList.size() * segmentSize;
             }
@@ -1910,7 +1872,7 @@ final class AdaptivePoolingAllocator {
         @Override
         void releaseSegment(int startIndex) {
             IntStack localFreeList = this.localFreeList;
-            if (ownerThread != null && Thread.currentThread() == ownerThread) {
+            if (localFreeList != null && Thread.currentThread() == ownerThread) {
                 localFreeList.push(startIndex);
                 // Only check the volatile state if the chunk has been marked for deallocation.
                 // This avoids a StoreLoad barrier on the hot path.
@@ -1978,7 +1940,7 @@ final class AdaptivePoolingAllocator {
                 assert Thread.currentThread() == ownerThread;
                 markedForDeallocation = true;
             }
-            int state = localFreeList.size();
+            int state = localFreeList != null ? localFreeList.size() : 0;
             STATE.set(this, state);
             // StoreLoad
             int totalSize = state + externalFreeList.size();
