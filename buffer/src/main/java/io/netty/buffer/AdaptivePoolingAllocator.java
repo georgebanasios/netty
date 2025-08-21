@@ -894,14 +894,11 @@ final class AdaptivePoolingAllocator {
     }
 
     private abstract static class AbstractMagazine implements Recycler.Handle<AdaptiveByteBuf> {
-        private static final AtomicLongFieldUpdater<AbstractMagazine> USED_MEMORY =
-                AtomicLongFieldUpdater.newUpdater(AbstractMagazine.class, "usedMemory");
         protected Chunk current;
         protected final MagazineGroup group;
         protected final ChunkController chunkController;
         protected final Queue<AdaptiveByteBuf> externalBuffers;
         protected final Thread ownerThread;
-        private volatile long usedMemory;
         private final boolean isShared;
 
         AbstractMagazine(MagazineGroup group, ChunkController chunkController, Queue<AdaptiveByteBuf> externalBuffers,
@@ -934,6 +931,16 @@ final class AdaptivePoolingAllocator {
          */
         abstract AdaptiveByteBuf pollFromLocalCache();
 
+        /**
+         * Adds the given value (can be negative) to the magazine's tracked used memory.
+         */
+        abstract void addUsedMemory(long value);
+
+        /**
+         * Returns the total memory currently in use by this magazine.
+         */
+        public abstract long usedMemory();
+
         @Override
         public abstract void recycle(AdaptiveByteBuf self);
 
@@ -961,29 +968,23 @@ final class AdaptivePoolingAllocator {
             chunkController.initializeSharedStateIn(other.chunkController);
         }
 
-        protected boolean isOwnerThread() {
+        protected final boolean isOwnerThread() {
             return ownerThread != null && Thread.currentThread() == ownerThread;
-        }
-
-        private void addUsedMemory(long value) {
-            if (isOwnerThread()) {
-                long current = usedMemory;
-                USED_MEMORY.lazySet(this, current + value);
-            } else {
-                USED_MEMORY.getAndAdd(this, value);
-            }
         }
     }
 
     private static class SharedMagazine extends AbstractMagazine {
         private static final AtomicReferenceFieldUpdater<SharedMagazine, Chunk> NEXT_IN_LINE;
+        private static final AtomicLongFieldUpdater<SharedMagazine> USED_MEMORY_UPDATER;
         static {
             NEXT_IN_LINE = AtomicReferenceFieldUpdater.newUpdater(SharedMagazine.class, Chunk.class, "nextInLine");
+            USED_MEMORY_UPDATER = AtomicLongFieldUpdater.newUpdater(SharedMagazine.class, "usedMemory");
         }
         private static final Chunk MAGAZINE_FREED = new BumpChunk();
 
         @SuppressWarnings("unused") // updated via NEXT_IN_LINE
         private volatile Chunk nextInLine;
+        private volatile long usedMemory;
         private final StampedLock allocationLock = new StampedLock();
 
         SharedMagazine(MagazineGroup group, ChunkController chunkController, Queue<AdaptiveByteBuf> externalBuffers) {
@@ -993,6 +994,16 @@ final class AdaptivePoolingAllocator {
         @Override
         AdaptiveByteBuf pollFromLocalCache() {
             return null;
+        }
+
+        @Override
+        void addUsedMemory(long value) {
+            USED_MEMORY_UPDATER.getAndAdd(this, value);
+        }
+
+        @Override
+        public long usedMemory() {
+            return usedMemory;
         }
 
         @Override
@@ -1229,8 +1240,12 @@ final class AdaptivePoolingAllocator {
     }
 
     private static final class ThreadLocalMagazine extends AbstractMagazine {
-        private volatile Chunk nextInLine;
+        private static final AtomicLongFieldUpdater<ThreadLocalMagazine> EXTERNAL_USED_MEMORY_UPDATER =
+                AtomicLongFieldUpdater.newUpdater(ThreadLocalMagazine.class, "externalUsedMemory");
         private final ArrayDeque<AdaptiveByteBuf> localBuffers;
+        private volatile Chunk nextInLine;
+        private volatile long externalUsedMemory; // For non-owneer threads
+        private long localUsedMemory; // For owner threads
 
         ThreadLocalMagazine(MagazineGroup group, ChunkController chunkController,
                             Queue<AdaptiveByteBuf> externalBuffers, ArrayDeque<AdaptiveByteBuf> localBuffers) {
@@ -1241,6 +1256,22 @@ final class AdaptivePoolingAllocator {
         @Override
         AdaptiveByteBuf pollFromLocalCache() {
             return localBuffers.pollLast();
+        }
+
+        @Override
+        void addUsedMemory(long value) {
+            if (isOwnerThread()) {
+                localUsedMemory += value;
+            } else {
+                EXTERNAL_USED_MEMORY_UPDATER.getAndAdd(this, value);
+            }
+        }
+
+        @Override
+        public long usedMemory() {
+            final long external = externalUsedMemory;
+            final long local = localUsedMemory;
+            return external + local;
         }
 
         @Override
@@ -1817,11 +1848,27 @@ final class AdaptivePoolingAllocator {
             }
         }
 
+        /**
+         * Drains segments from the thread-safe externalFreeList into the non-thread-safe localFreeList.
+         * This acts as a bulk-refill operation to restock the local cache, making later allocations
+         * faster by avoiding repeated access to the concurrent MpscIntQueue.
+         * <p>
+         * A capacity check is needed here. Because segments can be released by any thread and are
+         * always added to the externalFreeList, a situation can arise where this method is called
+         * to drain more segments than the localFreeList has available slots.
+         * Without checking `localFreeList.size() < capacity`, this would cause an
+         * ArrayIndexOutOfBoundsException by pushing onto a full stack. The loop therefore terminates
+         * when either the local list is full or the external list is empty.
+         */
         private int copyIntoLocalFreeList(IntStack localFreeList) {
             final MpscIntQueue externalFreeList = this.externalFreeList;
-            int index;
+            final int capacity = localFreeList.stack.length;
             int count = 0;
-            while ((index = externalFreeList.poll()) != FREE_LIST_EMPTY) {
+            while (localFreeList.size() < capacity) {
+                int index = externalFreeList.poll();
+                if (index == FREE_LIST_EMPTY) {
+                    break;
+                }
                 localFreeList.push(index);
                 count++;
             }

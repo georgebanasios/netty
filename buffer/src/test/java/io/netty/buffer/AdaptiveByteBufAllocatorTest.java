@@ -19,6 +19,7 @@ import io.netty.util.NettyRuntime;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import jdk.jfr.consumer.RecordedEvent;
 import jdk.jfr.consumer.RecordingStream;
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledForJreRange;
@@ -174,7 +175,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         assertTrue(buffer.release());
     }
 
-    @Test
+    @RepeatedTest(50)
     public void testAllocateWithoutLock() throws InterruptedException {
         final AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator();
         // Make `threadCount` bigger than `AdaptivePoolingAllocator.MAX_STRIPES`, to let thread collision easily happen.
