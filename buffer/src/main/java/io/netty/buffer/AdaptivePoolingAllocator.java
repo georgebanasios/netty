@@ -1733,11 +1733,6 @@ final class AdaptivePoolingAllocator {
         private final int[] stack;
         private int top;
 
-        IntStack(int capacity) {
-            stack = new int[capacity];
-            top = -1;
-        }
-
         IntStack(int[] initialValues) {
             stack = new int[initialValues.length];
             // copy reversed
