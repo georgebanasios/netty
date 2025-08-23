@@ -21,17 +21,18 @@ import io.netty.buffer.AdaptiveByteBufAllocator;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.MiByteBufAllocator;
-import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.microbench.util.AbstractMicrobenchmark;
 import io.netty.util.AbstractReferenceCounted;
 import io.netty.util.Recycler;
 import io.netty.util.ReferenceCounted;
 import io.netty.util.concurrent.FastThreadLocal;
+import io.netty.util.concurrent.FastThreadLocalThread;
 import io.netty.util.concurrent.MpscIntQueue;
 import io.netty.util.internal.MathUtil;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.CompilerControl;
 import org.openjdk.jmh.annotations.Measurement;
+import org.openjdk.jmh.annotations.Param;
 import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
@@ -49,9 +50,8 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.ScatteringByteChannel;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
 import java.util.SplittableRandom;
+import java.util.function.Supplier;
 
 @State(Scope.Thread)
 @Warmup(iterations = 10, time = 1)
@@ -59,11 +59,71 @@ import java.util.SplittableRandom;
 @Threads(1)
 public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmark {
 
-    private static final PooledByteBufAllocator pooledAlloc = PooledByteBufAllocator.DEFAULT;
-    private static final ByteBufAllocator adaptiveAllocator = new AdaptiveByteBufAllocator();
-    private static final MiByteBufAllocator miMallocAllocator = new MiByteBufAllocator();
-    private static final ThreadLocalFakeAdaptiveAllocator fakeAdaptiveAllocator =
-            new ThreadLocalFakeAdaptiveAllocator();
+    public enum AllocatorType {
+        ADAPTIVE(AdaptiveByteBufAllocator::new),
+        MIMALLOC(MiByteBufAllocator::new);
+        //POOLED(() -> PooledByteBufAllocator.DEFAULT),
+        //FAKE_ADAPTIVE(ThreadLocalFakeAdaptiveAllocator::new);
+
+        private final Supplier<ByteBufAllocator> factory;
+
+        AllocatorType(Supplier<ByteBufAllocator> factory) {
+            this.factory = factory;
+        }
+
+        private ByteBufAllocator create() {
+            return factory.get();
+        }
+    }
+
+    @Param({"ADAPTIVE", "MIMALLOC"})
+    public AllocatorType allocatorType;
+
+    @Param({"0", "200000"})
+    public int pollutionIterations;
+
+    private ByteBufAllocator allocator;
+
+    private ByteBuf[] directBuffers;
+    private ByteBuf[] heapBuffers;
+
+    @Setup
+    public void setupAllocatorAndPollute() throws InterruptedException {
+        this.allocator = allocatorType.create();
+        this.directBuffers = new ByteBuf[MAX_LIVE_BUFFERS];
+        this.heapBuffers = new ByteBuf[MAX_LIVE_BUFFERS];
+
+        if (pollutionIterations == 0) {
+            return;
+        }
+
+        int perThreadIterations = pollutionIterations / 2;
+
+        Runnable pollutionTask = () -> {
+            final ByteBuf[] pollutionBuffers = new ByteBuf[MAX_LIVE_BUFFERS];
+            Blackhole blackhole = new Blackhole("Today's password is swordfish. " +
+                                                "I understand instantiating Blackholes directly is dangerous.");
+
+            for (int i = 0; i < perThreadIterations; i++) {
+                performDirectAllocation(blackhole, allocator, pollutionBuffers);
+            }
+
+            for (ByteBuf buf : pollutionBuffers) {
+                if (buf != null && buf.refCnt() > 0) {
+                    buf.release();
+                }
+            }
+        };
+
+        Thread normalThread = new Thread(pollutionTask);
+        Thread fastThread = new FastThreadLocalThread(pollutionTask);
+
+        normalThread.start();
+        fastThread.start();
+
+        normalThread.join();
+        fastThread.join();
+    }
 
     private static class ThreadLocalFakeAdaptiveAllocator extends AbstractByteBufAllocator {
 
@@ -407,13 +467,6 @@ public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmar
     private static final int[] flattendSizeArray;
 
     private static final int MAX_LIVE_BUFFERS = 8192;
-    private final ByteBuf[] pooledDirectBuffers = new ByteBuf[MAX_LIVE_BUFFERS];
-    private final ByteBuf[] adaptiveDirectBuffers = new ByteBuf[MAX_LIVE_BUFFERS];
-    private final ByteBuf[] mimallocDirectBuffers = new ByteBuf[MAX_LIVE_BUFFERS];
-    private final ByteBuf[] pooledHeapBuffers = new ByteBuf[MAX_LIVE_BUFFERS];
-    private final ByteBuf[] adaptiveHeapBuffers = new ByteBuf[MAX_LIVE_BUFFERS];
-    private final ByteBuf[] mimallocHeapBuffers = new ByteBuf[MAX_LIVE_BUFFERS];
-    private final ByteBuf[] fakeDirectBuffers = new ByteBuf[MAX_LIVE_BUFFERS];
 
     private int[] releaseIndexes;
     private int[] sizes;
@@ -428,21 +481,19 @@ public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmar
 
     @TearDown
     public void releaseBuffers() {
-        List<ByteBuf[]> bufferLists = Arrays.asList(
-                pooledDirectBuffers,
-                adaptiveDirectBuffers,
-                mimallocDirectBuffers,
-                fakeDirectBuffers,
-                pooledHeapBuffers,
-                adaptiveHeapBuffers,
-                mimallocHeapBuffers);
-        for (ByteBuf[] bufList : bufferLists) {
-            for (ByteBuf buf : bufList) {
-                if (buf != null && buf.refCnt() > 0) {
-                    buf.release();
-                }
+        releaseBufferArray(directBuffers);
+        releaseBufferArray(heapBuffers);
+    }
+
+    private static void releaseBufferArray(ByteBuf[] buffers) {
+        if (buffers == null) {
+            return;
+        }
+        for (int i = 0; i < buffers.length; i++) {
+            if (buffers[i] != null && buffers[i].refCnt() > 0) {
+                buffers[i].release();
+                buffers[i] = null;
             }
-            Arrays.fill(bufList, null);
         }
     }
 
@@ -474,7 +525,8 @@ public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmar
         return index;
     }
 
-    private void directAlloc(Blackhole blackhole, ByteBufAllocator alloc, ByteBuf[] buffers) {
+    @CompilerControl(CompilerControl.Mode.DONT_INLINE)
+    private void performDirectAllocation(Blackhole blackhole, ByteBufAllocator alloc, ByteBuf[] buffers) {
         int size = sizes[getNextSizeIndex()];
         int releaseIndex = getNextReleaseIndex();
         ByteBuf oldBuf = buffers[releaseIndex];
@@ -498,46 +550,16 @@ public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmar
         blackhole.consume(buffers);
     }
 
-    @CompilerControl(CompilerControl.Mode.DONT_INLINE)
     @Benchmark
-    public void pooledDirect(Blackhole blackhole) {
-        directAlloc(blackhole, pooledAlloc, pooledDirectBuffers);
-    }
-
-    @CompilerControl(CompilerControl.Mode.DONT_INLINE)
-    @Benchmark
-    public void adaptiveDirect(Blackhole blackhole) {
-        directAlloc(blackhole, adaptiveAllocator, adaptiveDirectBuffers);
-    }
-
-    @CompilerControl(CompilerControl.Mode.DONT_INLINE)
-    @Benchmark
-    public void mimallocDirect(Blackhole blackhole) {
-        directAlloc(blackhole, miMallocAllocator, mimallocDirectBuffers);
+    public void directAllocation(Blackhole blackhole) {
+        performDirectAllocation(blackhole, allocator, directBuffers);
     }
 
 //    @CompilerControl(CompilerControl.Mode.DONT_INLINE)
 //    @Benchmark
-//    public void pooledHeap(Blackhole blackhole) {
-//        heapAlloc(blackhole, pooledAlloc, pooledHeapBuffers);
+//    public void heapAllocation(Blackhole blackhole) {
+//        heapAlloc(blackhole, allocator, buffers);
 //    }
-//
-//    @CompilerControl(CompilerControl.Mode.DONT_INLINE)
-//    @Benchmark
-//    public void adaptiveHeap(Blackhole blackhole) {
-//        heapAlloc(blackhole, adaptiveAllocator, adaptiveHeapBuffers);
-//    }
-//
-//    @CompilerControl(CompilerControl.Mode.DONT_INLINE)
-//    @Benchmark
-//    public void mimallocHeap(Blackhole blackhole) {
-//        heapAlloc(blackhole, miMallocAllocator, mimallocHeapBuffers);
-//    }
-
-    @Benchmark
-    public void fakeDirect(Blackhole blackhole) {
-        directAlloc(blackhole, fakeAdaptiveAllocator, fakeDirectBuffers);
-    }
 
     /**
      * Copied from AllocationPatternSimulator.
