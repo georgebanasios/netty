@@ -76,7 +76,7 @@ public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmar
         }
     }
 
-    @Param({"ADAPTIVE", "MIMALLOC"})
+    @Param({"ADAPTIVE"})
     public AllocatorType allocatorType;
 
     @Param({"0", "200000"})
