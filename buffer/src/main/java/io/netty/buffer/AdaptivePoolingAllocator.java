@@ -48,6 +48,7 @@ import java.nio.channels.ScatteringByteChannel;
 import java.nio.charset.Charset;
 import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.Iterator;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ThreadLocalRandom;
@@ -914,6 +915,17 @@ final class AdaptivePoolingAllocator {
         protected final boolean isOwnerThread() {
             return ownerThread != null && Thread.currentThread() == ownerThread;
         }
+
+        protected Chunk pollFromLocalCache(int size) {
+            for (Iterator<Chunk> it = localChunkCache.iterator(); it.hasNext();) {
+                Chunk chunk = it.next();
+                if (chunk.remainingCapacity() >= size) {
+                    it.remove();
+                    return chunk;
+                }
+            }
+            return null;
+        }
     }
 
     private static final class ChunkRegistry {
@@ -1107,36 +1119,24 @@ final class AdaptivePoolingAllocator {
 
         private boolean allocateAndRefillCurrentFromGroup(int size, int maxCapacity,
                                                           AdaptiveByteBuf buf, int startingCapacity) {
-            // We have the magazine lock so poll from the local FIFO queue instead of the external.
-            Chunk curr = localChunkCache.pollFirst();
+            Chunk curr = pollFromLocalCache(size);
             if (curr == null) {
-                // Refill local cache from the shared queue.
+                // The Local cache was empty or had no suitable chunks.
+                // Refill it from the shared queue and search one more time.
                 drainToLocalCache();
-                curr = localChunkCache.pollFirst();
+                curr = pollFromLocalCache(size);
             }
+
             if (curr == null) {
                 curr = chunkController.newChunkAllocation(size, this);
             } else {
                 curr.attachToMagazine(this);
-
-                int remainingCapacity = curr.remainingCapacity();
-                if (remainingCapacity == 0 || remainingCapacity < size) {
-                    // Check if we either retain the chunk in the nextInLine cache or releasing it.
-                    if (remainingCapacity < RETIRE_CAPACITY) {
-                        curr.releaseFromMagazine();
-                    } else {
-                        // See if it makes sense to transfer the Chunk to the nextInLine cache for later usage.
-                        // This method will release curr if this is not the case
-                        transferToNextInLineOrRelease(curr);
-                    }
-                    curr = chunkController.newChunkAllocation(size, this);
-                }
             }
 
             current = curr;
             try {
                 int remainingCapacity = curr.remainingCapacity();
-                assert remainingCapacity >= size;
+                assert remainingCapacity >= size; // Should be guaranteed by pollFromLocalCache or newChunkAllocation
                 if (remainingCapacity > startingCapacity) {
                     curr.readInitInto(buf, size, startingCapacity, maxCapacity);
                     curr = null;
@@ -1319,11 +1319,11 @@ final class AdaptivePoolingAllocator {
                                                           AdaptiveByteBuf buf, int startingCapacity) {
             Chunk curr = null;
             if (isOwnerThread()) {
-                curr = localChunkCache.pollFirst();
+                curr = pollFromLocalCache(size);
             }
 
             if (curr == null) {
-                // If not the owner or if the local cache is empty, use the group's external queue.
+                // If not the owner or if the local cache is empty/unsuitable, use the group's external queue.
                 curr = group.pollFromExternalQueue();
             }
             if (curr == null) {
