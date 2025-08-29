@@ -918,14 +918,17 @@ final class AdaptivePoolingAllocator {
         }
 
         protected final Chunk pollFromLocalCache(int size) {
-            for (int i = localChunkCache.size() - 1; i >= 0; i--) {
+            for (int i = 0; i < localChunkCache.size(); i++) {
                 Chunk candidate = localChunkCache.get(i);
+
                 if (candidate.hasRemainingCapacity(size)) {
                     int lastIndex = localChunkCache.size() - 1;
+
                     if (i < lastIndex) {
-                        localChunkCache.set(i, localChunkCache.get(lastIndex));
+                        localChunkCache.set(i, localChunkCache.remove(lastIndex));
+                    } else {
+                        localChunkCache.remove(lastIndex);
                     }
-                    localChunkCache.remove(lastIndex);
                     return candidate;
                 }
             }
