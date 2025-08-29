@@ -47,8 +47,9 @@ import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.ScatteringByteChannel;
 import java.nio.charset.Charset;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Iterator;
+import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ThreadLocalRandom;
@@ -841,7 +842,7 @@ final class AdaptivePoolingAllocator {
         protected final ChunkController chunkController;
         protected final Queue<AdaptiveByteBuf> externalBuffers;
         protected final Thread ownerThread;
-        protected final ArrayDeque<Chunk> localChunkCache;
+        protected final List<Chunk> localChunkCache;
         private final boolean isShared;
 
         AbstractMagazine(MagazineGroup group, ChunkController chunkController, Queue<AdaptiveByteBuf> externalBuffers,
@@ -851,7 +852,7 @@ final class AdaptivePoolingAllocator {
             this.externalBuffers = externalBuffers;
             this.ownerThread = ownerThread;
             this.isShared = ownerThread == null;
-            this.localChunkCache = new ArrayDeque<>(LOCAL_CHUNK_REUSE_QUEUE_CAPACITY);
+            this.localChunkCache = new ArrayList<>(LOCAL_CHUNK_REUSE_QUEUE_CAPACITY);
         }
 
         /**
@@ -916,12 +917,16 @@ final class AdaptivePoolingAllocator {
             return ownerThread != null && Thread.currentThread() == ownerThread;
         }
 
-        protected Chunk pollFromLocalCache(int size) {
-            for (Iterator<Chunk> it = localChunkCache.iterator(); it.hasNext();) {
-                Chunk chunk = it.next();
-                if (chunk.remainingCapacity() >= size) {
-                    it.remove();
-                    return chunk;
+        protected final Chunk pollFromLocalCache(int size) {
+            for (int i = localChunkCache.size() - 1; i >= 0; i--) {
+                Chunk candidate = localChunkCache.get(i);
+                if (candidate.hasRemainingCapacity(size)) {
+                    int lastIndex = localChunkCache.size() - 1;
+                    if (i < lastIndex) {
+                        localChunkCache.set(i, localChunkCache.get(lastIndex));
+                    }
+                    localChunkCache.remove(lastIndex);
+                    return candidate;
                 }
             }
             return null;
@@ -1160,7 +1165,7 @@ final class AdaptivePoolingAllocator {
                 if (chunk == null) {
                     break;
                 }
-                localChunkCache.addLast(chunk);
+                localChunkCache.add(chunk);
             }
         }
 
@@ -1375,7 +1380,7 @@ final class AdaptivePoolingAllocator {
             }
 
             if (isOwnerThread() && localChunkCache.size() < LOCAL_CHUNK_REUSE_QUEUE_CAPACITY) {
-                localChunkCache.addLast(lessUsefulChunk);
+                localChunkCache.add(lessUsefulChunk);
             } else {
                 lessUsefulChunk.releaseFromMagazine();
             }
@@ -1497,6 +1502,11 @@ final class AdaptivePoolingAllocator {
                     chunk.release();
                 }
             }
+        }
+
+        @Override
+        boolean hasRemainingCapacity(int size) {
+            return remainingCapacity() >= size;
         }
 
         @Override
@@ -1710,6 +1720,13 @@ final class AdaptivePoolingAllocator {
 
         public abstract void readInitInto(AdaptiveByteBuf buf, int size, int startingCapacity, int maxCapacity);
 
+        /**
+         * Checks if the chunk has enough remaining capacity to satisfy an allocation of the given size.
+         * @param size The size of the allocation.
+         * @return {@code true} if there is enough capacity, {@code false} otherwise.
+         */
+        abstract boolean hasRemainingCapacity(int size);
+
         public int remainingCapacity() {
             return capacity - allocatedBytes;
         }
@@ -1863,6 +1880,21 @@ final class AdaptivePoolingAllocator {
                 count++;
             }
             return count;
+        }
+
+        @Override
+        boolean hasRemainingCapacity(int size) {
+            if (size > segmentSize) {
+                return false;
+            }
+
+            if (ownerThread != null && Thread.currentThread() == ownerThread) {
+                if (!localFreeList.isEmpty()) {
+                    return true;
+                }
+            }
+
+            return !externalFreeList.isEmpty();
         }
 
         @Override
