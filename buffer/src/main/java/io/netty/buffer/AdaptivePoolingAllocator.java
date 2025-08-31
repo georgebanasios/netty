@@ -20,6 +20,8 @@ import io.netty.util.CharsetUtil;
 import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.NettyRuntime;
 import io.netty.util.Recycler;
+import io.netty.util.Recycler.Handle;
+import io.netty.util.Recycler.ObjectFactory;
 import io.netty.util.ReferenceCounted;
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.FastThreadLocalThread;
@@ -46,7 +48,6 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.ScatteringByteChannel;
 import java.nio.charset.Charset;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -357,12 +358,15 @@ final class AdaptivePoolingAllocator {
 
     private static final class ThreadLocalCache {
         final MagazineGroup[] magazineGroups;
-        final Queue<AdaptiveByteBuf> externalRecycledBuffers;
-        final ArrayDeque<AdaptiveByteBuf> localRecycledBuffers;
+        final Recycler<AdaptiveByteBuf> recycler;
 
         ThreadLocalCache(AdaptivePoolingAllocator allocator) {
-            this.externalRecycledBuffers = PlatformDependent.newFixedMpscQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY);
-            this.localRecycledBuffers = new ArrayDeque<>();
+            this.recycler = Recycler.newPinnedRecycler(new ObjectFactory<AdaptiveByteBuf>() {
+                @Override
+                public AdaptiveByteBuf newInstance(Handle<AdaptiveByteBuf> handle) {
+                    return new AdaptiveByteBuf(handle);
+                }
+            }, MAGAZINE_BUFFER_QUEUE_CAPACITY, Thread.currentThread());
             this.magazineGroups = createMagazineGroupSizeClasses(allocator, true, this);
         }
 
@@ -397,8 +401,7 @@ final class AdaptivePoolingAllocator {
             if (isThreadLocal) {
                 ownerThread = Thread.currentThread();
                 magazineExpandLock = null;
-                magazine = new ThreadLocalMagazine(this, chunkControllerFactory.create(this),
-                                                   cache.externalRecycledBuffers, cache.localRecycledBuffers);
+                magazine = new ThreadLocalMagazine(this, chunkControllerFactory.create(this), cache.recycler);
             } else {
                 ownerThread = null;
                 magazineExpandLock = new StampedLock();
@@ -836,7 +839,7 @@ final class AdaptivePoolingAllocator {
         }
     }
 
-    private abstract static class AbstractMagazine implements Recycler.Handle<AdaptiveByteBuf> {
+    private abstract static class AbstractMagazine {
         protected static final AtomicReferenceFieldUpdater<AbstractMagazine, Chunk> NEXT_IN_LINE =
                 AtomicReferenceFieldUpdater.newUpdater(AbstractMagazine.class, Chunk.class, "nextInLine");
 
@@ -845,16 +848,13 @@ final class AdaptivePoolingAllocator {
         protected Chunk current;
         protected final MagazineGroup group;
         protected final ChunkController chunkController;
-        protected final Queue<AdaptiveByteBuf> externalBuffers;
         protected final Thread ownerThread;
         protected final List<Chunk> localChunkCache;
         private final boolean isShared;
 
-        AbstractMagazine(MagazineGroup group, ChunkController chunkController, Queue<AdaptiveByteBuf> externalBuffers,
-                         Thread ownerThread) {
+        AbstractMagazine(MagazineGroup group, ChunkController chunkController, Thread ownerThread) {
             this.group = group;
             this.chunkController = chunkController;
-            this.externalBuffers = externalBuffers;
             this.ownerThread = ownerThread;
             this.isShared = ownerThread == null;
             this.localChunkCache = new ArrayList<>(LOCAL_CHUNK_REUSE_QUEUE_CAPACITY);
@@ -871,12 +871,6 @@ final class AdaptivePoolingAllocator {
         abstract void free();
 
         /**
-         * Tries to get a buffer from the fast, thread-local cache.
-         * @return An {@link AdaptiveByteBuf} if successful, {@code null} otherwise.
-         */
-        abstract AdaptiveByteBuf pollFromLocalCache();
-
-        /**
          * Adds the given value (can be negative) to the magazine's tracked used memory.
          */
         abstract void addUsedMemory(long value);
@@ -886,24 +880,7 @@ final class AdaptivePoolingAllocator {
          */
         public abstract long usedMemory();
 
-        @Override
-        public abstract void recycle(AdaptiveByteBuf self);
-
-        public AdaptiveByteBuf newBuffer() {
-            AdaptiveByteBuf buf = null;
-            if (isOwnerThread()) {
-                buf = pollFromLocalCache();
-            }
-            if (buf == null) {
-                buf = externalBuffers.poll();
-            }
-            if (buf == null) {
-                buf = new AdaptiveByteBuf(this);
-            }
-            buf.resetRefCnt();
-            buf.discardMarks();
-            return buf;
-        }
+        public abstract AdaptiveByteBuf newBuffer();
 
         boolean offerToQueue(Chunk chunk) {
             return group.offerToQueue(chunk);
@@ -967,14 +944,42 @@ final class AdaptivePoolingAllocator {
         private static final Chunk MAGAZINE_FREED = new BumpChunk();
         private volatile long usedMemory;
         private final StampedLock allocationLock = new StampedLock();
+        private final Recycler.Handle<AdaptiveByteBuf> handle;
+        private final Queue<AdaptiveByteBuf> externalBuffers;
 
         SharedMagazine(MagazineGroup group, ChunkController chunkController, Queue<AdaptiveByteBuf> externalBuffers) {
-            super(group, chunkController, externalBuffers, null);
+            super(group, chunkController, null);
+            this.handle = new SharedMagazineHandle(this);
+            this.externalBuffers = externalBuffers;
+        }
+
+        private static final class SharedMagazineHandle extends Recycler.EnhancedHandle<AdaptiveByteBuf> {
+            private final SharedMagazine magazine;
+
+            SharedMagazineHandle(SharedMagazine magazine) {
+                this.magazine = magazine;
+            }
+
+            @Override
+            public void recycle(AdaptiveByteBuf object) {
+                magazine.externalBuffers.offer(object);
+            }
+
+            @Override
+            public void unguardedRecycle(Object object) {
+                recycle((AdaptiveByteBuf) object);
+            }
         }
 
         @Override
-        AdaptiveByteBuf pollFromLocalCache() {
-            return null;
+        public AdaptiveByteBuf newBuffer() {
+            AdaptiveByteBuf buf = externalBuffers.poll();
+            if (buf == null) {
+                buf = new AdaptiveByteBuf(this.handle);
+            }
+            buf.resetRefCnt();
+            buf.discardMarks();
+            return buf;
         }
 
         @Override
@@ -985,11 +990,6 @@ final class AdaptivePoolingAllocator {
         @Override
         public long usedMemory() {
             return usedMemory;
-        }
-
-        @Override
-        public void recycle(AdaptiveByteBuf self) {
-            externalBuffers.offer(self);
         }
 
         @Override
@@ -1221,19 +1221,22 @@ final class AdaptivePoolingAllocator {
     private static final class ThreadLocalMagazine extends AbstractMagazine {
         private static final AtomicLongFieldUpdater<ThreadLocalMagazine> EXTERNAL_USED_MEMORY_UPDATER =
                 AtomicLongFieldUpdater.newUpdater(ThreadLocalMagazine.class, "externalUsedMemory");
-        private final ArrayDeque<AdaptiveByteBuf> localBuffers;
-        private volatile long externalUsedMemory; // For non-owneer threads
+        private volatile long externalUsedMemory; // For non-owner threads
         private long localUsedMemory; // For owner threads
+        private final Recycler<AdaptiveByteBuf> recycler;
 
-        ThreadLocalMagazine(MagazineGroup group, ChunkController chunkController,
-                            Queue<AdaptiveByteBuf> externalBuffers, ArrayDeque<AdaptiveByteBuf> localBuffers) {
-            super(group, chunkController, externalBuffers, group.ownerThread);
-            this.localBuffers = localBuffers;
+        ThreadLocalMagazine(MagazineGroup group, ChunkController chunkController, Recycler<AdaptiveByteBuf> recycler) {
+            super(group, chunkController, group.ownerThread);
+            this.recycler = recycler;
         }
 
         @Override
-        AdaptiveByteBuf pollFromLocalCache() {
-            return localBuffers.pollLast();
+        public AdaptiveByteBuf newBuffer() {
+            AdaptiveByteBuf buf = recycler.get();
+
+            buf.resetRefCnt();
+            buf.discardMarks();
+            return buf;
         }
 
         @Override
@@ -1250,15 +1253,6 @@ final class AdaptivePoolingAllocator {
             final long external = externalUsedMemory;
             final long local = localUsedMemory;
             return external + local;
-        }
-
-        @Override
-        public void recycle(AdaptiveByteBuf self) {
-            if (isOwnerThread()) {
-                localBuffers.addLast(self);
-            } else {
-                externalBuffers.offer(self);
-            }
         }
 
         @Override
