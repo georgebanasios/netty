@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.concurrent.FastThreadLocalThread;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -85,5 +86,50 @@ class AdaptivePoolingAllocatorTest implements Supplier<String> {
         for (; i <= maxSizeIncluded; i++) {
             assertEquals(expectedSizeBucket, AdaptivePoolingAllocator.sizeToBucket(i), this);
         }
+    }
+
+    @Test
+    public void test() {
+        FastThreadLocalThread.runWithFastThreadLocal(() -> {
+            AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator(true, true);
+            int retained = 128;
+            int size = 1024;
+            boolean reuseFirstChunk = true;
+            ByteBuf[] firstChunk = new ByteBuf[retained];
+            for (int i = 0; i < retained; i++) {
+                firstChunk[i] = alloc.directBuffer(size, size);
+            }
+            // here the first chunk should be in the reusable chunk queue, but still unable to be used, since full!
+            // a new chunk is allocated
+            ByteBuf[] secondChunk = new ByteBuf[retained];
+            for (int i = 0; i < retained; i++) {
+                secondChunk[i] = alloc.directBuffer(size, size);
+            }
+            // the second chunk has been made fully available for reuse in the reusable chunk queue
+            for (int i = 0; i < retained; i++) {
+                secondChunk[i].release();
+            }
+            // we now have 2 chunks in the reusable chunk queue, but both are full
+            // a new allocation should use the first chunk to allocate from
+            if (reuseFirstChunk) {
+                // we have freed
+                firstChunk[0].release();
+                firstChunk[0] = null;
+            }
+            // DEBUG here: it's a bit of a waste here to NOT use the second chunk if reuseFirstChunk is false
+            // since the second chunk is fully available for reuse
+            ByteBuf last = alloc.directBuffer(size - 1, size - 1);
+            // if reuseFirstChunk is true, the first chunk is empty and still the current: after this allocation
+            // the second chunk is used and the first one is released back in the reusable queue
+            ByteBuf veryLast = alloc.directBuffer(size - 1, size - 1);
+            veryLast.release();
+            last.release();
+            // release all buffers
+            for (int i = 0; i < retained; i++) {
+                if (firstChunk[i] != null) {
+                    firstChunk[i].release();
+                }
+            }
+        });
     }
 }

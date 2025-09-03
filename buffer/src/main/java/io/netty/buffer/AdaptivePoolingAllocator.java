@@ -20,8 +20,6 @@ import io.netty.util.CharsetUtil;
 import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.NettyRuntime;
 import io.netty.util.Recycler;
-import io.netty.util.Recycler.Handle;
-import io.netty.util.Recycler.ObjectFactory;
 import io.netty.util.ReferenceCounted;
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.FastThreadLocalThread;
@@ -361,12 +359,12 @@ final class AdaptivePoolingAllocator {
         final Recycler<AdaptiveByteBuf> recycler;
 
         ThreadLocalCache(AdaptivePoolingAllocator allocator) {
-            this.recycler = Recycler.newPinnedRecycler(new ObjectFactory<AdaptiveByteBuf>() {
+            this.recycler = new Recycler<AdaptiveByteBuf>(Thread.currentThread(), true) {
                 @Override
-                public AdaptiveByteBuf newInstance(Handle<AdaptiveByteBuf> handle) {
+                protected AdaptiveByteBuf newObject(Handle<AdaptiveByteBuf> handle) {
                     return new AdaptiveByteBuf(handle);
                 }
-            }, MAGAZINE_BUFFER_QUEUE_CAPACITY, Thread.currentThread());
+            };
             this.magazineGroups = createMagazineGroupSizeClasses(allocator, true, this);
         }
 
@@ -957,6 +955,7 @@ final class AdaptivePoolingAllocator {
             private final SharedMagazine magazine;
 
             SharedMagazineHandle(SharedMagazine magazine) {
+                super();
                 this.magazine = magazine;
             }
 
