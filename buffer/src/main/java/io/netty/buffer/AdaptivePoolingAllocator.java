@@ -1001,10 +1001,7 @@ final class AdaptivePoolingAllocator {
         }
 
         private boolean allocateWithoutLock(int size, int maxCapacity, AdaptiveByteBuf buf) {
-            Chunk curr = nextInLine;
-            if (curr == null || !NEXT_IN_LINE.compareAndSet(this, curr, null)) {
-                curr = null;
-            }
+            Chunk curr = NEXT_IN_LINE.getAndSet(this, null);
             if (curr == MAGAZINE_FREED) {
                 restoreMagazineFreed();
                 return false;
@@ -1318,6 +1315,10 @@ final class AdaptivePoolingAllocator {
             Chunk curr = null;
             if (isOwnerThread()) {
                 curr = pollFromLocalCache(size);
+
+                if (curr == null) {
+                    flushLocalCacheToExternalQueue();
+                }
             }
 
             if (curr == null) {
@@ -1404,6 +1405,15 @@ final class AdaptivePoolingAllocator {
                 chunk.releaseFromMagazine();
             }
         }
+
+        private void flushLocalCacheToExternalQueue() {
+            while (!localChunkCache.isEmpty()) {
+                Chunk chunkToShare = localChunkCache.remove(0);
+                if (!group.offerToQueue(chunkToShare)) {
+                    chunkToShare.markToDeallocate();
+                }
+            }
+        }
     }
 
     private static class BumpChunk extends Chunk implements ReferenceCounted {
@@ -1416,7 +1426,9 @@ final class AdaptivePoolingAllocator {
         private volatile int refCnt;
 
         static {
-            switch (ReferenceCountUpdater.updaterTypeOf(BumpChunk.class, "refCnt")) {
+            ReferenceCountUpdater.UpdaterType updaterType = ReferenceCountUpdater
+                    .updaterTypeOf(BumpChunk.class, "refCnt");
+            switch (updaterType) {
             case Atomic:
                 AIF_UPDATER = newUpdater(BumpChunk.class, "refCnt");
                 REFCNT_FIELD_OFFSET = -1;
@@ -1452,7 +1464,7 @@ final class AdaptivePoolingAllocator {
                 };
                 break;
             default:
-                throw new Error("Unknown updater type for Chunk");
+                throw new Error("Unexpected updater type for Chunk: " + updaterType);
             }
         }
 
@@ -1920,8 +1932,13 @@ final class AdaptivePoolingAllocator {
             // We can therefore put them in the shared queue as soon as the magazine is done with this chunk.
             AbstractMagazine mag = magazine;
             detachFromMagazine();
-            if (!mag.offerToQueue(this)) {
-                markToDeallocate();
+
+            if (mag.isOwnerThread() && mag.localChunkCache.size() < LOCAL_CHUNK_REUSE_QUEUE_CAPACITY) {
+                mag.localChunkCache.add(this);
+            } else {
+                if (!mag.offerToQueue(this)) {
+                    markToDeallocate();
+                }
             }
         }
 
@@ -1939,7 +1956,7 @@ final class AdaptivePoolingAllocator {
             } else {
                 boolean segmentReturned = externalFreeList.offer(startIndex);
                 assert segmentReturned : "Unable to return segment " + startIndex + " to free list";
-                // this has implicitly a StoreLoad barrier due to the multi-producer nature of the queue
+                // This has implicitly a StoreLoad barrier due to the multi-producer nature of the queue
                 int state = this.state;
                 if (state != AVAILABLE) {
                     handleStateOnExternalReleaseSegment(state);

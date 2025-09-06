@@ -60,8 +60,8 @@ import java.util.function.Supplier;
 public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmark {
 
     public enum AllocatorType {
-        ADAPTIVE(AdaptiveByteBufAllocator::new),
-        MIMALLOC(MiByteBufAllocator::new);
+        ADAPTIVE(AdaptiveByteBufAllocator::new);
+        //MIMALLOC(MiByteBufAllocator::new);
         //POOLED(() -> PooledByteBufAllocator.DEFAULT),
         //FAKE_ADAPTIVE(ThreadLocalFakeAdaptiveAllocator::new);
 
